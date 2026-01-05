@@ -7,7 +7,7 @@ use tokio::sync::broadcast;
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
 #[derive(Parser)]
-#[command(name = "rust-chat")]
+#[command(name = "rust-chat-app")]
 #[command(about = "A simple TCP chat with Server and Client modes", long_about = None)]
 struct Cli {
     #[command(subcommand)]
