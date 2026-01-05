@@ -1,0 +1,11 @@
+[package]
+name = "rust_chat"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] } # Асинхронность
+clap = { version = "4.4", features = ["derive"] } # Аргументы командной строки
+colored = "2.1.0"                                # Цвета в терминале
+tokio-util = { version = "0.7", features = ["codec"] } # Работа с потоками данных
+futures-util = { version = "0.3", features = ["sink"] } # Вспомогательные функции для потоков
