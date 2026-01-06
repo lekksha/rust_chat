@@ -1,27 +1,28 @@
 use clap::{Parser, Subcommand};
 use colored::*;
-use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
-use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
+// Структура для аргументов командной строки
 #[derive(Parser)]
 #[command(name = "rust-chat")]
-#[command(about = "A simple TCP chat with Server and Client modes", long_about = None)]
+#[command(about = "Простой TCP чат", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
 
+// Подкоманды (сервер или клиент)
 #[derive(Subcommand)]
 enum Commands {
-    /// Запуск сервера
+    /// Запустить сервер
     Server {
         #[arg(short, long, default_value = "127.0.0.1:8080")]
         addr: String,
     },
-    /// Запуск клиента
+    /// Запустить клиент
     Client {
         #[arg(short, long, default_value = "127.0.0.1:8080")]
         addr: String,
@@ -42,99 +43,116 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// --- СЕРВЕРНАЯ ЛОГИКА ---
-
+// --- СЕРВЕР ---
 async fn run_server(addr: String) -> Result<(), Box<dyn std::error::Error>> {
+    // Создаем TCP слушатель
     let listener = TcpListener::bind(&addr).await?;
-    // Канал широковещательной рассылки (16 сообщений в буфере)
-    let (tx, _rx) = broadcast::channel::<(String, SocketAddr)>(16);
 
-    println!("{} сервер запущен на {}", " INFO ".on_green().black(), addr);
+    // Создаем канал для рассылки сообщений всем клиентам
+    let (sender, _receiver) = broadcast::channel::<(String, SocketAddr)>(16);
+
+    println!("{} Сервер запущен на {}", "✓".green(), addr);
 
     loop {
-        let (socket, addr) = listener.accept().await?;
-        let tx = tx.clone();
-        let mut rx = tx.subscribe();
+        // Ждем новое подключение
+        let (socket, client_addr) = listener.accept().await?;
+        println!("{} Новый клиент: {}", "→".blue(), client_addr);
 
-        println!("{} новое подключение: {}", " CONN ".on_blue().black(), addr);
+        // Клонируем отправитель для нового клиента
+        let client_sender = sender.clone();
+        // Создаем подписчика для этого клиента
+        let mut client_receiver = sender.subscribe();
 
+        // Запускаем обработку клиента в отдельной задаче
         tokio::spawn(async move {
-            let (reader, writer) = socket.into_split();
-            let mut lines_reader = FramedRead::new(reader, LinesCodec::new());
-            let mut lines_writer = FramedWrite::new(writer, LinesCodec::new());
+            // Разделяем сокет на чтение и запись
+            let (read_half, mut write_half) = socket.into_split();
+
+            // Создаем буферизированного читателя
+            let reader = BufReader::new(read_half);
+            let mut lines = reader.lines();
 
             loop {
                 tokio::select! {
-                    // Читаем сообщение от клиента и отправляем всем остальным
-                    result = lines_reader.next() => {
-                        match result {
-                            Some(Ok(msg)) => {
-                                let _ = tx.send((msg, addr));
+                    // Читаем строку от клиента
+                    line = lines.next_line() => {
+                        match line {
+                            Ok(Some(message)) => {
+                                // Отправляем сообщение всем клиентам
+                                let _ = client_sender.send((message, client_addr));
                             }
-                            _ => break, // Ошибка или дисконнект
+                            _ => break, // Клиент отключился
                         }
                     }
-                    // Получаем сообщение из канала рассылки и пишем клиенту
-                    result = rx.recv() => {
-                        match result {
-                            Ok((msg, other_addr)) => {
-                                if addr != other_addr {
-                                    if let Err(_) = lines_writer.send(msg).await {
-                                        break;
-                                    }
+
+                    // Получаем сообщение для отправки клиенту
+                    message = client_receiver.recv() => {
+                        match message {
+                            Ok((msg, sender_addr)) => {
+                                // Не отправляем сообщение обратно отправителю
+                                if sender_addr != client_addr {
+                                    let _ = write_half.write_all(msg.as_bytes()).await;
+                                    let _ = write_half.write_all(b"\n").await;
                                 }
                             }
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
                             Err(_) => break,
                         }
                     }
                 }
             }
-            println!("{} клиент отключился: {}", " DISC ".on_red().black(), addr);
+
+            println!("{} Клиент отключился: {}", "✗".red(), client_addr);
         });
     }
 }
 
-// --- КЛИЕНТСКАЯ ЛОГИКА ---
-
+// --- КЛИЕНТ ---
 async fn run_client(addr: String, name: String) -> Result<(), Box<dyn std::error::Error>> {
+    // Подключаемся к серверу
     let socket = TcpStream::connect(&addr).await?;
-    println!("{} Подключено к {}", " OK ".on_green().black(), addr);
+    println!("{} Подключен к {}", "✓".green(), addr);
 
-    let (reader, writer) = socket.into_split();
-    let mut lines_reader = FramedRead::new(reader, LinesCodec::new());
-    let mut lines_writer = FramedWrite::new(writer, LinesCodec::new());
+    // Разделяем сокет на чтение и запись
+    let (read_half, mut write_half) = socket.into_split();
 
-    let my_tag = format!("@{}", name);
-    let mut stdin_reader = FramedRead::new(tokio::io::stdin(), LinesCodec::new());
+    // Создаем читатель для сокета
+    let reader = BufReader::new(read_half);
+    let mut lines_from_server = reader.lines();
+
+    // Создаем читатель для ввода с клавиатуры
+    let stdin_reader = BufReader::new(tokio::io::stdin());
+    let mut lines_from_user = stdin_reader.lines();
+
+    println!("Введите сообщения (Ctrl+C для выхода):");
 
     loop {
         tokio::select! {
-            // Читаем входящие сообщения от сервера
-            result = lines_reader.next() => {
-                match result {
-                    Some(Ok(msg)) => {
-                        if msg.contains(&my_tag) {
-                            // Подсвечиваем сообщение, если в нем упомянут пользователь
-                            println!("{}", msg.yellow().bold());
+            // Читаем сообщение от сервера
+            server_line = lines_from_server.next_line() => {
+                match server_line {
+                    Ok(Some(message)) => {
+                        // Если в сообщении есть упоминание нашего имени
+                        if message.contains(&format!("@{}", name)) {
+                            println!("{}", message.yellow().bold());
                         } else {
-                            println!("{}", msg);
+                            println!("{}", message);
                         }
                     }
                     _ => {
-                        println!("Соединение с сервером потеряно.");
+                        println!("Сервер отключился");
                         break;
                     }
                 }
             }
-            // Читаем ввод пользователя из консоли и отправляем на сервер
-            result = stdin_reader.next() => {
-                match result {
-                    Some(Ok(content)) => {
-                        let full_msg = format!("{}: {}", name.bright_cyan(), content);
-                        if let Err(_) = lines_writer.send(full_msg).await {
-                            break;
-                        }
+
+            // Читаем ввод пользователя
+            user_line = lines_from_user.next_line() => {
+                match user_line {
+                    Ok(Some(message)) => {
+                        // Формируем и отправляем сообщение
+                        let full_message = format!("{}: {}", name.cyan(), message);
+                        let _ = write_half.write_all(full_message.as_bytes()).await;
+                        let _ = write_half.write_all(b"\n").await;
                     }
                     _ => break,
                 }
